@@ -1,8 +1,22 @@
 from flask import Flask, request, jsonify
 import dns.resolver
 from ipwhois import IPWhois
+import re
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import logging
 
 app = Flask(__name__)
+
+# Set up rate limiting
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"]
+)
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
 # Define the function to process domain data (the same code as before)
 def get_ns_records(domain):
@@ -10,7 +24,8 @@ def get_ns_records(domain):
         result = dns.resolver.resolve(domain, 'NS')
         ns_records = [ns.to_text() for ns in result]
         return ns_records
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException):
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException) as e:
+        logging.error(f"Error resolving NS records for {domain}: {e}")
         return None
 
 def get_ip_from_ns(ns_record):
@@ -18,7 +33,8 @@ def get_ip_from_ns(ns_record):
         result = dns.resolver.resolve(ns_record, 'A')
         ip_addresses = [ip.to_text() for ip in result]
         return ip_addresses
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException):
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException) as e:
+        logging.error(f"Error resolving A records for NS {ns_record}: {e}")
         return None
 
 def get_a_record(domain):
@@ -26,7 +42,8 @@ def get_a_record(domain):
         result = dns.resolver.resolve(domain, 'A')
         ip_addresses = [ip.to_text() for ip in result]
         return ip_addresses
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException):
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException) as e:
+        logging.error(f"Error resolving A records for {domain}: {e}")
         return None
 
 def get_abuse_contact(rdap_result):
@@ -54,7 +71,8 @@ def get_hosting_info(ip_address):
             abuse_contacts = get_abuse_contact(rdap_result)
             return hosting_provider, abuse_contacts
         return None, None
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error getting hosting info for IP {ip_address}: {e}")
         return None, None
 
 def get_unique_providers_and_abuse_contacts(hosting_providers, abuse_contacts):
@@ -95,8 +113,18 @@ def get_ns_and_a_details(domain):
         "AbuseContacts": abuse_contacts
     }
 
+# Validate domain name
+def is_valid_domain(domain):
+    regex = re.compile(
+        r'^(?:[a-zA-Z0-9]' # First character of the domain
+        r'(?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)' # Sub domain + hostname
+        r'+[a-zA-Z]{2,6}$' # First level TLD
+    )
+    return re.match(regex, domain) is not None
+
 # Define the API endpoint
 @app.route('/get-domain-details', methods=['POST'])
+@limiter.limit("10 per minute")
 def get_domain_details():
     # Get the domain from the POST request data
     data = request.get_json()
@@ -105,12 +133,24 @@ def get_domain_details():
     if not domain:
         return jsonify({"error": "No domain provided"}), 400
 
+    if not is_valid_domain(domain):
+        return jsonify({"error": "Invalid domain provided"}), 400
+
     # Get the details for the domain
     result = get_ns_and_a_details(domain)
 
     # Return the result as JSON
     return jsonify(result)
 
+# Set security headers
+@app.after_request
+def set_security_headers(response):
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    return response
+
 # Run the Flask app
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=False)
